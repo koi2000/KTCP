@@ -28,11 +28,11 @@
     <ClCompile Include="src\xnet_tiny\xnet_tiny.c">
       <Filter>xnet_tiny</Filter>
     </ClCompile>
-    <ClCompile Include="src\pcap_device.c">
-      <Filter>库文件</Filter>
-    </ClCompile>
     <ClCompile Include="src\app.c">
       <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="..\lib\xnet\pcap_device.c">
+      <Filter>库文件</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
@@ -45,7 +45,7 @@
     <ClInclude Include="src\xnet_tiny\xnet_tiny.h">
       <Filter>xnet_tiny</Filter>
     </ClInclude>
-    <ClInclude Include="src\pcap_device.h">
+    <ClInclude Include="..\lib\xnet\pcap_device.h">
       <Filter>库文件</Filter>
     </ClInclude>
   </ItemGroup>

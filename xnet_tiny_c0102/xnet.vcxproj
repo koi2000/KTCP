@@ -122,6 +122,8 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <StackReserveSize>1000000</StackReserveSize>
+      <HeapReserveSize>1000000</HeapReserveSize>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -141,15 +143,15 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="..\lib\xnet\pcap_device.c" />
     <ClCompile Include="src\app.c" />
-    <ClCompile Include="src\pcap_device.c" />
     <ClCompile Include="src\xnet_app\port_pcap.c" />
     <ClCompile Include="src\xnet_app\xserver_datetime.c" />
     <ClCompile Include="src\xnet_app\xserver_http.c" />
     <ClCompile Include="src\xnet_tiny\xnet_tiny.c" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="src\pcap_device.h" />
+    <ClInclude Include="..\lib\xnet\pcap_device.h" />
     <ClInclude Include="src\xnet_app\xserver_datetime.h" />
     <ClInclude Include="src\xnet_app\xserver_http.h" />
     <ClInclude Include="src\xnet_tiny\xnet_tiny.h" />

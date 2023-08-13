@@ -21,8 +21,8 @@
 
 // 加载pcap的lib，根据32位或64位平台来加
 #ifdef _WIN64
-#pragma comment(lib, "..\\lib\\npcap\\Lib\\x64\\Packet.lib")  
-#pragma comment(lib, "..\\lib\\npcap\\Lib\\x64\\wpcap.lib") 
+#pragma comment(lib, "..\\lib\\npcap\\lib\\x64\\Packet.lib")
+#pragma comment(lib, "..\\lib\\npcap\\lib\\x64\\wpcap.lib")
 #else 
 #pragma comment(lib, "..\\lib\\npcap\\Lib\\Packet.lib")  
 #pragma comment(lib, "..\\lib\\npcap\\Lib\\wpcap.lib") 
