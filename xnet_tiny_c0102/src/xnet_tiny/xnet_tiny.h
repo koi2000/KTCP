@@ -56,12 +56,27 @@ typedef struct _arp_packet_t {
 	uint8_t target_ip[XNET_IPV4_ADDR_SIZE];
 }xarp_packet_t;
 
+typedef struct _xip_hdr_t {
+	uint8_t hdr_len : 4;
+	uint8_t version : 4;
+	uint8_t tos;
+	uint16_t total_len;
+	uint16_t id;
+	uint16_t flags_fragment;
+	uint8_t ttl;
+	uint8_t protocol;
+	uint8_t hdr_checksum;
+	uint8_t src_ip[XNET_IPV4_ADDR_SIZE];
+	uint8_t dest_ip[XNET_IPV4_ADDR_SIZE];
+}xip_hdr_t;
+
 
 #pragma pack()
 
 typedef enum _xnet_err_t {
 	XNET_ERR_OK = 0,
 	XNET_ERR_IO = -1,
+	XNET_ERR_NONE = -2,
 }xnet_err_t;
 
 // 网络数据结构
@@ -131,6 +146,15 @@ void xarp_init(void);
 int xarp_make_request(const xipaddr_t* ipaddr);
 void xarp_in(xnet_packet_t* packet);
 void xarp_poll(void);
+
+// ip相关
+// IPV4
+#define XNET_VERSION_IPV4 4
+// 缺省的IP包TTL值
+#define XNET_IP_DEFAULT_TTL 64
+void xip_init(void);
+void xip_in(xnet_packet_t* packet);
+xnet_err_t xip_out(xnet_protocol_t protocol, xipaddr_t* dest_ip, xnet_packet_t* packet);
 
 // 最底层
 void xnet_init(void);

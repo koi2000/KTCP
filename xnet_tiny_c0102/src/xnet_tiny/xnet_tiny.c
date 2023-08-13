@@ -10,10 +10,11 @@ static xnet_packet_t tx_packet, rx_packet;
 // 节省内存，只使用一个表项
 static xarp_entry_t arp_entry;
 static xnet_time_t arp_timer;
+static void update_arp_entry(uint8_t* src_ip, uint8_t* mac_addr);
 
 #define swap_order16(v) ((((v) & 0xFF) << 8) | (((v) >> 8) & 0xFF))
 #define xipaddr_is_equal_buf(addr,buf) (memcmp((addr)->array,(buf),XNET_IPV4_ADDR_SIZE)==0)
-
+#define xipaddr_is_equal(addr1,addr2) ((addr1)->addr==(addr2)->addr)
 /*
 * 检查是否超时
 * @param time 前一时间
@@ -94,7 +95,9 @@ static void truncate_packet(xnet_packet_t *packet,uint16_t size){
 static xnet_err_t ethernet_init(void){
 	xnet_err_t err = xnet_driver_open(netif_mac);
 	if (err < 0)return err;
-	return XNET_ERR_OK;
+	// 开启抓包工具wireshark，能在窗口发现如下数据包抓取
+	// 1	0.000000	Dell_f9:e6:77	Broadcast	ARP	42	ARP Announcement for 192.168.137.2
+	return xarp_make_request(&netif_ipaddr);
 }
 
 /*
@@ -134,6 +137,18 @@ static void ethernet_in(xnet_packet_t* packet) {
 		xarp_in(packet);
 		break;
 	case XNET_PROTOCOL_IP:
+		// 从IP包头中提取IP地址，从以太网包头中提取mac地址
+		// 更新ARP表
+#if 0
+		xip_hdr_t* iphdr = (xip_hdr_t*)(packet->data + sizeof(xether_hdr_t));
+		if (packet->size >= sizeof(xether_hdr_t) + sizeof(xip_hdr_t)) {
+			if (memcmp(iphdr->dest_ip, &netif_ipaddr.array, XNET_IPV4_ADDR_SIZE) == 0) {
+				update_arp_entry(iphdr->src_ip, hdr->src);
+			}
+		}
+#endif
+		remove_header(packet, sizeof(xether_hdr_t));
+		xip_in(packet);
 		break;
 	}
 }
@@ -223,9 +238,24 @@ xnet_err_t xarp_make_request(const xipaddr_t * ipaddr){
 	arp_packet->opcode = swap_order16(XARP_REQUEST);
 	memcpy(arp_packet->sender_mac, netif_mac, XNET_MAC_ADDR_SIZE);
 	memcpy(arp_packet->sender_ip, netif_ipaddr.array, XNET_IPV4_ADDR_SIZE);
-	memcpy(arp_packet->target_mac, 0, XNET_MAC_ADDR_SIZE);
+	memset(arp_packet->target_mac, 0, XNET_MAC_ADDR_SIZE);
 	memcpy(arp_packet->target_ip, ipaddr->array, XNET_IPV4_ADDR_SIZE);
 	return ethernet_out_to(XNET_PROTOCOL_ARP, ether_broadcast, packet);
+}
+
+/*
+* 解析指定的IP地址，如果不在ARP表项中，则发送ARP请求
+* @param ipaddr 查找的ip地址
+* @param mac_addr 返回的mac地址存储区
+* @return XNET_ERR_OK 查找成功，XNET_ERR_NONE 查找失败
+*/
+xnet_err_t xarp_resolve(const xipaddr_t* ipaddr,uint8_t** mac_addr){
+	if ((arp_entry.state == XARP_ENTRY_OK) && xipaddr_is_equal(ipaddr, &arp_entry.ipaddr)) {
+		*mac_addr = arp_entry.macaddr;
+		return XNET_ERR_OK;
+	}
+	xarp_make_request(ipaddr);
+	return XNET_ERR_NONE;
 }
 
 /*
@@ -280,11 +310,107 @@ void xarp_in(xnet_packet_t* packet) {
 }
 
 /*
+* 校验和计算
+* @param buf 校验数据区的起始地址
+* @param len 数据区的长度，以字节为单位
+* @param pre_sum 累加的之前的值，用于多次调用checksum
+* @param complement 是否对累加和的结果进行取反
+* @return 校验和结果
+*/
+static uint16_t checksum16(uint16_t*buf,uint16_t len,uint16_t pre_sum,int complement){
+	uint32_t checksum = pre_sum;
+	uint16_t high;
+	while (len > 1) {
+		checksum += *buf++;
+		len -= 2;
+	}
+	if (len > 0) {
+		checksum += *(uint8_t*)buf;
+	}
+	while ((high = checksum >> 16) != 0) {
+		checksum = high + (checksum & 0xffff);
+	}
+	return complement ? (uint16_t)~checksum : (uint16_t)checksum;
+}
+
+/*
+* IP的初始化
+*/
+void xip_init(void){}
+
+/*
+* IP层的输入处理
+* @param packet 输入的IP数据包
+*/
+void xip_in(xnet_packet_t* packet) {
+	xip_hdr_t* iphdr = (xip_hdr_t*)packet->data;
+	uint32_t total_size, header_size;
+	uint16_t pre_checksum;
+	// 检查版本号
+	if (iphdr->version != XNET_VERSION_IPV4) {
+		return;
+	}
+	// 检查长度
+	header_size = iphdr->hdr_len * 4;
+	total_size = swap_order16(iphdr->total_len);
+	if ((header_size < sizeof(xip_hdr_t)) || ((total_size < header_size) || (packet->size < total_size))) {
+		return;
+	}
+
+	// 校验和要求检查
+	pre_checksum = iphdr->hdr_checksum;
+	iphdr->hdr_checksum = 0;
+	if (pre_checksum != checksum16((uint16_t*)iphdr, header_size, 0, 1)) {
+		return;
+	}
+	// 只处理目标IP为自己的数据包，其它广播之类的IP全部丢掉
+	if (!xipaddr_is_equal_buf(&netif_ipaddr, iphdr->dest_ip)) {
+		return;
+	}
+
+	// 多跟复用，分别交由ICMP、UDP、TCP处理
+	switch (iphdr->protocol) {
+	default:
+		break;
+	}
+}
+
+/*
+* IP包的输出
+* @param protocol 上层协议 ICMP UDP或TCP
+* @param dest_ip
+* @param packet
+* @return
+*/
+xnet_err_t xip_out(xnet_protocol_t protocol, xipaddr_t* dest_ip, xnet_packet_t* packet) {
+	static uint32_t ip_packet_id = 0;
+	xip_hdr_t* iphdr;
+	add_header(packet, sizeof(xip_hdr_t));
+	iphdr = (xip_hdr_t*)packet->data;
+	iphdr->version = XNET_VERSION_IPV4;
+	iphdr->hdr_len = sizeof(xip_hdr_t) / 4;
+	iphdr->tos = 0;
+	iphdr->total_len = swap_order16(packet->size);
+	iphdr->id = swap_order16(ip_packet_id);
+	iphdr->flags_fragment = 0;
+	iphdr->ttl = XNET_IP_DEFAULT_TTL;
+	iphdr->protocol = protocol;
+	memcpy(iphdr->dest_ip, dest_ip->array, XNET_IPV4_ADDR_SIZE);
+	memcpy(iphdr->src_ip, netif_ipaddr.array, XNET_IPV4_ADDR_SIZE);
+	iphdr->hdr_checksum = 0;
+	iphdr->hdr_checksum = checksum16((uint16_t*)iphdr, sizeof(xip_hdr_t), 0, 1);;
+
+	ip_packet_id++;
+	return ethernet_out(dest_ip, packet);
+}
+
+/*
 * 协议栈的初始化
 */
 void xnet_init(void) {
 	ethernet_init();
 	xarp_init();
+	xip_init();
 }
 
 /*
