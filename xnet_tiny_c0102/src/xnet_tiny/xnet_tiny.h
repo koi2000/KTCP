@@ -14,7 +14,10 @@
 #define XARP_CFG_MAX_RETRIES 4
 // 最大支持的UDP连接数
 #define XUDP_CFG_MAX_UDP 10
-
+// 最大支持的TCP连接数
+#define XTCP_CFG_MAX_TCP 40
+// TCP收发缓冲区大小
+#define XTCP_CFG_RTX_BUF_SIZE 2048
 #pragma pack(1)
 
 // IP地址长度
@@ -105,6 +108,36 @@ typedef struct _xudp_hdr_t {
 	uint16_t checksum;
 }xudp_hdr_t;
 
+typedef struct _xtcp_hdr_t {
+	// 源端口 + 目标端口
+	uint16_t src_port, dest_port;
+	// 自己发送的数据的起始序号
+	uint32_t seq;
+	// 通知对方期望接受的下一字节的序号
+	uint32_t ack;
+	union {
+		struct {
+#define XTCP_FLAG_FIN (1<<0)
+#define XTCP_FLAG_SYN (1<<1)
+#define XTCP_FLAG_RST (1<<2)
+#define XTCP_FLAG_ACK (1<<4)
+			// 标志位
+			uint16_t flags : 6;
+			// 保留位
+			uint16_t reserved : 6;
+			// 首部长度，以4字节位为单位
+			uint16_t hdr_len : 4;
+		};
+		uint16_t all;
+	}hdr_flags;
+	// 窗口大小，告诉对方自己能接受多少数据
+	uint16_t window;
+	// 校验和
+	uint16_t checksum;
+	// 紧急指针
+	uint16_t urgent_ptr;
+}xtcp_hdr_t;
+
 #pragma pack()
 
 typedef enum _xnet_err_t {
@@ -114,6 +147,8 @@ typedef enum _xnet_err_t {
 	XNET_ERR_BINDED = -3,
 	XNET_ERR_PARAM = -4,
 	XNET_ERR_MEM = -5,
+	XNET_ERR_STATE = -6,
+	XNET_ERR_WIN_0 = -8,
 }xnet_err_t;
 
 // 网络数据结构
@@ -148,6 +183,8 @@ typedef enum _xnet_protocol_t {
 	XNET_PROTOCOL_ICMP = 1,
 	// UDP协议
 	XNET_PROTOCOL_UDP = 17,
+	// TCP协议
+	XNET_PROTOCOL_TCP = 6,
 }xnet_protocol_t;
 
 /*
@@ -234,6 +271,69 @@ void xudp_close(xudp_t* udp);
 xudp_t* xudp_find(uint16_t port);
 xnet_err_t xudp_bind(xudp_t* udp, uint16_t local_port);
 
+// TCP相关
+typedef enum _tcp_state_t {
+	XTCP_STATE_FREE,
+	XTCP_STATE_CLOSED,
+	XTCP_STATE_LISTEN,
+	XTCP_STATE_SYNC_RECVD,
+	XTCP_STATE_FIN_WAIT_1,
+	XTCP_STATE_FIN_WAIT_2,
+	XTCP_STATE_CLOSING,
+	XTCP_STATE_TIMED_WAIT,
+	XTCP_STATE_CLOSE_WAIT,
+	XTCP_STATE_LAST_ACK,
+}xtcp_state_t;
+
+typedef enum _xtcp_conn_state_t {
+	XTCP_CONN_CONNECTED,
+	XTCP_CONN_DATA_RECV,
+	XTCP_CONN_CLOSED,
+}xtcp_conn_state_t;
+
+typedef struct _xtcp_buf_t {
+	// 总的数据量 + 未发送的数据量
+	uint16_t data_count, unacked_count;
+	// 起始，结束，下一待发送位置 
+	uint16_t front, tail, next;
+	// 数据缓存空间
+	uint8_t data[XTCP_CFG_RTX_BUF_SIZE];
+}xtcp_buf_t;
+
+#define XTCP_KIND_END 0
+#define XTCP_KIND_MSS 2
+#define XTCP_MSS_DEFAULT 1460
+typedef struct _xtcp_t xtcp_t;
+typedef xnet_err_t(*xtcp_handler_t)(xtcp_t*tcp,xtcp_conn_state_t event);
+struct _xtcp_t {
+	// 状态
+	xtcp_state_t state;
+	// 本地端口 + 源端口
+	uint16_t local_port, remote_port;
+	// 源IP
+	xipaddr_t remote_ip;
+	// 未确定的起始序号，下一发送序号
+	uint32_t unack_seq, next_seq;
+	// 期望对方发来的包序号
+	uint32_t ack;
+	//对方的mss，不含选项区
+	uint16_t remote_mss;
+	// 对方的窗口大小
+	uint16_t remote_win;
+	// 事件处理会调
+	xtcp_handler_t handler;
+	// 收发缓冲区
+	xtcp_buf_t rx_buf, tx_buf;
+};
+
+void xtcp_init(void);
+void xtcp_in(xipaddr_t* remote_ip, xnet_packet_t* packet);
+xtcp_t* xtcp_open(xtcp_handler_t handler);
+xnet_err_t xtcp_bind(xtcp_t* tcp, uint16_t local_port);
+xnet_err_t xtcp_listen(xtcp_t* tcp);
+xnet_err_t xtcp_close(xtcp_t* tcp);
+uint16_t xtcp_read(xtcp_t* tcp, uint8_t* data, uint16_t size);
+int xtcp_write(xtcp_t* tcp, uint8_t* data, uint16_t size);
 // 最底层
 void xnet_init(void);
 void xnet_poll(void);

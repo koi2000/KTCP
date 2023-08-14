@@ -1,6 +1,12 @@
-#include <string.h>    
+#include <string.h>   
+#include <time.h>
+#include <stdlib.h>
+#include <stdio.h>
 #include "xnet_tiny.h"
+
 #define min(a,b) ((a)>(b)?(b):(a))
+#define XTCP_DATA_MAX_SIZE (XNET_CFG_PACKET_MAX_SIZE - sizeof(xether_hdr_t) - sizeof(xip_hdr_t) - sizeof(xtcp_hdr_t))
+#define tcp_get_init_seq() ((rand()<<16)_rand())
 
 static const xipaddr_t netif_ipaddr = XNET_CFG_NETIF_IP;
 static const uint8_t ether_broadcast[] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
@@ -12,10 +18,22 @@ static xarp_entry_t arp_entry;
 static xnet_time_t arp_timer;
 // UDP连接块
 static xudp_t udp_socket[XUDP_CFG_MAX_UDP];
+// TCP连接块
+static xtcp_t tcp_socket[XTCP_CFG_MAX_TCP];
 
 static void update_arp_entry(uint8_t* src_ip, uint8_t* mac_addr);
 
 #define swap_order16(v) ((((v) & 0xFF) << 8) | (((v) >> 8) & 0xFF))
+uint32_t swap_order32(uint32_t v){
+	uint32_t r_v;
+	uint8_t* src = (uint8_t*)&v;
+	uint8_t* dest = (uint8_t*)&r_v;
+	dest[0] = src[3];
+	dest[1] = src[2];
+	dest[2] = src[1];
+	dest[3] = src[0];
+	return r_v;
+}
 #define xipaddr_is_equal_buf(addr,buf) (memcmp((addr)->array,(buf),XNET_IPV4_ADDR_SIZE)==0)
 #define xipaddr_is_equal(addr1,addr2) ((addr1)->addr==(addr2)->addr)
 #define xipaddr_from_buf(dest,buf) ((dest)->addr=*(uint32_t*)(buf))
@@ -638,6 +656,56 @@ xnet_err_t xudp_bind(xudp_t* udp, uint16_t local_port) {
 	udp->local_port = local_port;
 	return XNET_ERR_OK;
 }
+
+// TCP
+/*
+* 分配一个TCP连接块
+* @return 分配结果，0-分配失败
+*/
+static void tcp_buf_init(xtcp_buf_t* tcp_buf) {
+	// 全部指向0，无数据或未发送的数据
+	tcp_buf->tail = tcp_buf->next = tcp_buf->front = 0;
+	tcp_buf->data_count = tcp_buf->unacked_count = 0;
+}
+
+/*
+* 获取buf中空闲的字节量
+* @param tcp_buf 待查询的结构
+* @return 空闲的字节量
+*/
+static uint16_t tcp_buf_free_count(xtcp_buf_t* tcp_ubf) {
+	return XTCP_CFG_RTX_BUF_SIZE - tcp_ubf->data_count;
+}
+
+/*
+* 获取已经ack的字节数量
+*/
+static uint16_t tcp_buf_wait_send_count(xtcp_buf_t* tcp_buf) {
+	return tcp_buf->data_count - tcp_buf->unacked_count;
+}
+
+/*
+* 增加buf中确认的数据量
+* @param tcp_buf buf缓存
+* @param size 新增确认的数据量
+*/
+static void tcp_buf_add_acked_count(xtcp_buf_t* tcp_buf, uint16_t size) {
+	// 新增确认，需要窗口左侧移动
+	tcp_buf->tail += size;
+	if (tcp_buf->tail >= XTCP_CFG_RTX_BUF_SIZE) {
+		tcp_buf->tail = 0;
+	}
+	tcp_buf->data_count -= size;
+	tcp_buf->unacked_count -= size;
+}
+
+/*
+* 向buf中写入新的需要发送的数据，仅供发送使用
+* @param tcp_buf 写入buf
+* @param from 数据源
+* @param size 数据字节量
+* @return 实际写入的量 由于缓存空间有限，实际写入的可能比期望的要小一些
+*/
 
 /*
 * 协议栈的初始化
