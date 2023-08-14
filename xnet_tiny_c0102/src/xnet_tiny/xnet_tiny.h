@@ -12,6 +12,8 @@
 #define XARP_CFG_ENTRY_PENDING_TMO (1)
 // ARP表挂起时重试查询次数
 #define XARP_CFG_MAX_RETRIES 4
+// 最大支持的UDP连接数
+#define XUDP_CFG_MAX_UDP 10
 
 #pragma pack(1)
 
@@ -57,16 +59,27 @@ typedef struct _arp_packet_t {
 }xarp_packet_t;
 
 typedef struct _xip_hdr_t {
+	// 首部长度，4字节为单位
 	uint8_t hdr_len : 4;
+	// 版本号
 	uint8_t version : 4;
+	// 服务类型
 	uint8_t tos;
+	// 总长度
 	uint16_t total_len;
+	// 标识符
 	uint16_t id;
+	// 标志与分段
 	uint16_t flags_fragment;
+	// 存活时间
 	uint8_t ttl;
+	// 上层协议
 	uint8_t protocol;
+	// 首部校验和
 	uint8_t hdr_checksum;
+	// 源IP
 	uint8_t src_ip[XNET_IPV4_ADDR_SIZE];
+	// 目标IP
 	uint8_t dest_ip[XNET_IPV4_ADDR_SIZE];
 }xip_hdr_t;
 
@@ -83,12 +96,24 @@ typedef struct _xicmp_hdr_t {
 	uint16_t seq;
 }xicmp_hdr_t;
 
+typedef struct _xudp_hdr_t {
+	// 源端口 + 目标端口
+	uint16_t src_port, dest_port;
+	// 整个数据包的长度
+	uint16_t total_len;
+	//校验和
+	uint16_t checksum;
+}xudp_hdr_t;
+
 #pragma pack()
 
 typedef enum _xnet_err_t {
 	XNET_ERR_OK = 0,
 	XNET_ERR_IO = -1,
 	XNET_ERR_NONE = -2,
+	XNET_ERR_BINDED = -3,
+	XNET_ERR_PARAM = -4,
+	XNET_ERR_MEM = -5,
 }xnet_err_t;
 
 // 网络数据结构
@@ -108,6 +133,7 @@ int xnet_check_tmo(xnet_time_t* time, uint32_t sec);
 
 xnet_packet_t* xnet_alloc_for_send(uint16_t data_size);
 xnet_packet_t* xnet_alloc_for_read(uint16_t data_size);
+void truncate_packet(xnet_packet_t* packet, uint16_t size);
 
 xnet_err_t xnet_driver_open(uint8_t* mac_addr);
 xnet_err_t xnet_driver_send(xnet_packet_t* packet);
@@ -120,6 +146,8 @@ typedef enum _xnet_protocol_t {
 	XNET_PROTOCOL_IP = 0x0800,
 	// ICMP协议
 	XNET_PROTOCOL_ICMP = 1,
+	// UDP协议
+	XNET_PROTOCOL_UDP = 17,
 }xnet_protocol_t;
 
 /*
@@ -170,14 +198,41 @@ void xip_init(void);
 void xip_in(xnet_packet_t* packet);
 xnet_err_t xip_out(xnet_protocol_t protocol, xipaddr_t* dest_ip, xnet_packet_t* packet);
 // ICMP相关
+// 回显请求
 #define XICMP_CODE_ECHO_REQUEST 8
+// 回显响应
 #define XICMP_CODE_ECHO_REPLY 0
+// 目标不可达
 #define XICMP_TYPE_UNREACH 3
+// 端口不可达
 #define XICMP_CODE_PORT_UNREACH 3
+// 协议不可达
 #define XICMP_CODE_PRO_UNREACH 2
 void xicmp_init(void);
 void xicmp_in(xipaddr_t *src_ip,xnet_packet_t* packet);
 xnet_err_t xicmp_dest_unreach(uint8_t code, xip_hdr_t* ip_hdr);
+
+typedef struct _xudp_t xudp_t;
+typedef xnet_err_t(*xudp_handler_t)(xudp_t* udp, xipaddr_t* src_ip, uint16_t src_port, xnet_packet_t* packet);
+struct _xudp_t {
+	enum {
+		// UDP未使用
+		XUDP_STATE_FREE,
+		// UDP已使用
+		XUDP_STATE_USED,
+	}state;
+	// 本地端口
+	uint16_t local_port;
+	// 事件处理回调
+	xudp_handler_t handler;
+};
+void xudp_init(void);
+void xudp_in(xudp_t* udp, xipaddr_t* src_ip, xnet_packet_t* packet);
+int xudp_out(xudp_t* udp, xipaddr_t* dest_ip, uint16_t dest_port, xnet_packet_t* packet);
+xudp_t* xudp_open(xudp_handler_t handler);
+void xudp_close(xudp_t* udp);
+xudp_t* xudp_find(uint16_t port);
+xnet_err_t xudp_bind(xudp_t* udp, uint16_t local_port);
 
 // 最底层
 void xnet_init(void);

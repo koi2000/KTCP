@@ -10,6 +10,9 @@ static xnet_packet_t tx_packet, rx_packet;
 // 节省内存，只使用一个表项
 static xarp_entry_t arp_entry;
 static xnet_time_t arp_timer;
+// UDP连接块
+static xudp_t udp_socket[XUDP_CFG_MAX_UDP];
+
 static void update_arp_entry(uint8_t* src_ip, uint8_t* mac_addr);
 
 #define swap_order16(v) ((((v) & 0xFF) << 8) | (((v) >> 8) & 0xFF))
@@ -495,6 +498,146 @@ xnet_err_t xicmp_dest_unreach(uint8_t code, xip_hdr_t* ip_hdr) {
 	return xip_out(XNET_PROTOCOL_ICMP, &dest_ip, packet);
 }
 
+/*
+* 计算UDP伪校验和
+* @param src_ip 源IP
+* @param dest_ip 目标IP
+* @param protocol 协议
+* @param buf 数据区
+* @param len 数据长度
+* @return 校验和结果
+*/
+static uint16_t checksum_peso(const xipaddr_t* src_ip, const xipaddr_t* dest_ip,
+	uint8_t protocol, uint16_t* buf, uint16_t len) {
+	uint8_t zero_protocol[2] = { 0,protocol };
+	uint16_t c_len = swap_order16(len);
+	uint32_t sum = checksum16((uint16_t*)src_ip->array, XNET_IPV4_ADDR_SIZE, 0, 0);
+	sum = checksum16((uint16_t*)dest_ip->array, XNET_IPV4_ADDR_SIZE, sum, 0);
+	sum = checksum16((uint16_t*)zero_protocol, 2, sum, 0);
+	sum = checksum16((uint16_t*)&c_len, 2, sum, 0);
+	return checksum16(buf, len, sum, 1);
+}
+
+/*
+* UDP初始化
+*/
+void xudp_init(void) {
+	memset(udp_socket, 0, sizeof(udp_socket));
+}
+
+/*
+* UDP输入处理
+* @param udp 待处理的UDP
+* @param src_ip 数据包来源
+* @param packet 数据包结构
+*/
+void xudp_in(xudp_t* udp, xipaddr_t* src_ip, xnet_packet_t* packet) {
+	xudp_hdr_t* udp_hdr = (xudp_hdr_t*)packet->data;
+	uint16_t pre_checksum;
+	uint16_t src_port;
+	if ((packet->size < sizeof(xudp_hdr_t)) || (packet->size < swap_order16(udp_hdr->total_len))) {
+		return;
+	}
+	pre_checksum = udp_hdr->checksum;
+	udp_hdr->checksum = 0;
+	if (pre_checksum != 0) {
+		uint16_t checksum = checksum_peso(src_ip, &netif_ipaddr, XNET_PROTOCOL_UDP,
+			(uint16_t*)udp_hdr, swap_order16(udp_hdr->total_len));
+		checksum = (checksum == 0) ? 0xFFFF : checksum;
+		if (checksum!=pre_checksum) {
+			return;
+		}
+	}
+	src_port = swap_order16(udp_hdr->src_port);
+	remove_header(packet, sizeof(xudp_hdr_t));
+	if (udp->handler) {
+		udp->handler(udp, src_ip, src_port, packet);
+	}
+}
+
+/*
+* 发送一个UDP数据包
+* @param udp udp结构
+* @param dest_ip 目标ip
+* @param dest_port 目标端口
+* @param packet 待发送的包
+* @return 发送结果
+*/
+int xudp_out(xudp_t* udp, xipaddr_t* dest_ip, uint16_t dest_port, xnet_packet_t* packet) {
+	xudp_hdr_t* udp_hdr;
+	uint16_t checksum;
+	add_header(packet, sizeof(xudp_hdr_t));
+	udp_hdr = (xudp_hdr_t*)packet->data;
+	udp_hdr->src_port = swap_order16(udp->local_port);
+	udp_hdr->dest_port = swap_order16(dest_port);
+	udp_hdr->total_len = swap_order16(packet->size);
+	udp_hdr->checksum = 0;
+	checksum = checksum_peso(&netif_ipaddr, dest_ip, XNET_PROTOCOL_UDP, (uint16_t*)udp_hdr, packet->size);
+	udp_hdr->checksum = (checksum == 0) ? 0xFFFF : checksum;
+	return xip_out(XNET_PROTOCOL_UDP, dest_ip, packet);
+}
+
+/*
+* 打开UDP结构
+* @param handler 事件处理回调函数
+* @return 打开的xudp_t结构
+*/
+xudp_t* xudp_open(xudp_handler_t handler) {
+	xudp_t* udp, * end;
+	for (udp = udp_socket, end = &udp_socket[XUDP_CFG_MAX_UDP]; udp < end; udp++) {
+		if (udp->state == XUDP_STATE_FREE) {
+			udp->state = XUDP_STATE_USED;
+			udp->local_port = 0;
+			udp->handler = handler;
+			return udp;
+		}
+	}
+	return (xudp_t*)0;
+}
+
+/*
+* 关闭UDP连接
+* @param udp 待关闭的xudp_t结构
+*/
+void xudp_close(xudp_t* udp) {
+	udp->state = XUDP_STATE_FREE;
+}
+
+/*
+* 查找指定端口对应的udp结构
+* @param port 待查找的端口
+* @return 找到的xudp_t结构
+*/
+xudp_t* xudp_find(uint16_t port) {
+	xudp_t* udp, * end = &udp_socket[XUDP_CFG_MAX_UDP];
+
+	for (udp = udp_socket; udp < end; udp++) {
+		if ((udp->state != XUDP_STATE_FREE) && (udp->local_port == port)) {
+			return udp;
+		}
+	}
+	return (xudp_t*)0;
+}
+
+/*
+* 绑定xudp_t结构到指定端口
+* @param udp待绑定的结构
+* @param local_port 目标端口
+* @return 绑定结果
+*/
+xnet_err_t xudp_bind(xudp_t* udp, uint16_t local_port) {
+	xudp_t* curr, * end;
+	if (local_port == 0) {
+		return XNET_ERR_PARAM;
+	}
+	for (curr = udp, end = &udp_socket[XUDP_CFG_MAX_UDP]; curr < end; curr++) {
+		if ((curr != udp) && (curr->local_port == local_port)) {
+			return XNET_ERR_BINDED;
+		}
+	}
+	udp->local_port = local_port;
+	return XNET_ERR_OK;
+}
 
 /*
 * 协议栈的初始化
@@ -504,6 +647,7 @@ void xnet_init(void) {
 	xarp_init();
 	xip_init();
 	xicmp_init();
+	xudp_init();
 }
 
 /*
