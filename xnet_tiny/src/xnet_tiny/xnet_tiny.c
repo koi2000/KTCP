@@ -700,12 +700,94 @@ static void tcp_buf_add_acked_count(xtcp_buf_t* tcp_buf, uint16_t size) {
 }
 
 /*
+* 增加buf中未确认的数据量
+* @param tcp_buf buf缓存
+* @param size 新增未确认的数据量
+*/
+static void tcp_buf_add_unacked_count(xtcp_buf_t*tcp_buf,uint16_t size){
+	// 未确认增加，仅增加计数
+	tcp_buf->unacked_count += size;
+}
+
+/*
 * 向buf中写入新的需要发送的数据，仅供发送使用
 * @param tcp_buf 写入buf
 * @param from 数据源
 * @param size 数据字节量
 * @return 实际写入的量 由于缓存空间有限，实际写入的可能比期望的要小一些
 */
+static uint16_t tcp_buf_write(xtcp_buf_t* tcp_buf, uint8_t* from, uint16_t size) {
+	int i;
+	// 对数据进行截断，可能只能写一部分的数据
+	size = min(size, tcp_buf_free_count(tcp_buf));
+	// 逐个拷贝，注意回绕
+	for (i = 0; i < size; i++) {
+		// 向buffer中拷贝数据
+		tcp_buf->data[tcp_buf->front++] = *from++;
+		if (tcp_buf->front >= XTCP_CFG_RTX_BUF_SIZE) {
+			tcp_buf->front = 0;
+		}
+	}
+	tcp_buf->data_count += size;
+	return size;
+}
+
+/*
+* 从buf中读取数据用于发送
+* @param tcp_buf 读取的buf
+* @param to 读取的目的地
+* @param size 读取的字节量
+* @return 实际读取的字节量
+*/
+static uint16_t tcp_buf_read_for_send(xtcp_buf_t*tcp_buf,uint8_t* to,uint16_t size){
+	int i;
+	uint16_t wait_send_count = tcp_buf->data_count - tcp_buf->unacked_count;
+	size = min(size, wait_send_count);
+	for (i = 0; i < size; i++) {
+		*to++ = tcp_buf->data[tcp_buf->next++];
+		if (tcp_buf->next >= XTCP_CFG_RTX_BUF_SIZE) {
+			tcp_buf->next = 0;
+		}
+	}
+	return size;
+}
+
+/*
+* 从buf中读取数据，仅接收使用
+* @param tcp_buf 读取的buf
+* @param to 读取的目的地
+* @param size 读取的字节量
+* @return 实际读取的大小
+*/
+static uint16_t tcp_buf_read(xtcp_buf_t* tcp_buf, uint8_t* to, uint16_t size) {
+	int i;
+	size = min(size, tcp_buf->data_count);
+	for (i = 0; i < size; i++) {
+		*to++ = tcp_buf->data[tcp_buf->tail++];
+		if (tcp_buf->tail>=XTCP_CFG_RTX_BUF_SIZE){
+			tcp_buf->tail = 0;
+		}
+	}
+	tcp_buf->data_count -= size;
+	return size;
+}
+
+/*
+* 从收到的tcp包中，读取数据到tcp接收缓存
+* @param tcp 待读取的tcp连接
+* @param flags 包头标志
+* @param from 从包头的哪里读取
+* @param size 读取的字节量
+* @return 实际读取的字节量
+*/
+static uint16_t tcp_recv(xtcp_t* tcp, uint8_t flags, uint8_t* from, uint16_t size) {
+	uint16_t read_size = tcp_buf_write(&tcp->rx_buf, from, size);
+	tcp->ack += read_size;
+	if (flags & (XTCP_FLAG_SYN | XTCP_FLAG_FIN)) {
+		tcp->ack++;
+	}
+	return read_size;
+}
 
 /*
 * 协议栈的初始化
