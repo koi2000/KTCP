@@ -70,6 +70,18 @@ typedef struct _xip_hdr_t {
 	uint8_t dest_ip[XNET_IPV4_ADDR_SIZE];
 }xip_hdr_t;
 
+typedef struct _xicmp_hdr_t {
+	// 类型
+	uint8_t type;
+	// 代码
+	uint8_t code;
+	// ICMP报文的校验和
+	uint16_t checksum;
+	// 标识符
+	uint16_t id;
+	// 序号
+	uint16_t seq;
+}xicmp_hdr_t;
 
 #pragma pack()
 
@@ -106,6 +118,8 @@ typedef enum _xnet_protocol_t {
 	XNET_PROTOCOL_ARP = 0x0806,
 	// IP协议
 	XNET_PROTOCOL_IP = 0x0800,
+	// ICMP协议
+	XNET_PROTOCOL_ICMP = 1,
 }xnet_protocol_t;
 
 /*
@@ -155,6 +169,15 @@ void xarp_poll(void);
 void xip_init(void);
 void xip_in(xnet_packet_t* packet);
 xnet_err_t xip_out(xnet_protocol_t protocol, xipaddr_t* dest_ip, xnet_packet_t* packet);
+// ICMP相关
+#define XICMP_CODE_ECHO_REQUEST 8
+#define XICMP_CODE_ECHO_REPLY 0
+#define XICMP_TYPE_UNREACH 3
+#define XICMP_CODE_PORT_UNREACH 3
+#define XICMP_CODE_PRO_UNREACH 2
+void xicmp_init(void);
+void xicmp_in(xipaddr_t *src_ip,xnet_packet_t* packet);
+xnet_err_t xicmp_dest_unreach(uint8_t code, xip_hdr_t* ip_hdr);
 
 // 最底层
 void xnet_init(void);

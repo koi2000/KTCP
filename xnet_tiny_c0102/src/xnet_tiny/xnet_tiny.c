@@ -15,6 +15,7 @@ static void update_arp_entry(uint8_t* src_ip, uint8_t* mac_addr);
 #define swap_order16(v) ((((v) & 0xFF) << 8) | (((v) >> 8) & 0xFF))
 #define xipaddr_is_equal_buf(addr,buf) (memcmp((addr)->array,(buf),XNET_IPV4_ADDR_SIZE)==0)
 #define xipaddr_is_equal(addr1,addr2) ((addr1)->addr==(addr2)->addr)
+#define xipaddr_from_buf(dest,buf) ((dest)->addr=*(uint32_t*)(buf))
 /*
 * 检查是否超时
 * @param time 前一时间
@@ -118,6 +119,21 @@ static xnet_err_t ethernet_out_to(xnet_protocol_t protocol,const uint8_t*mac_add
 	ether_hdr->protocol = swap_order16(protocol);
 	// 数据发送
 	return xnet_driver_send(packet);
+}
+
+/*
+* 将IP数据包通过以太网发送出去
+* @param dest_ip 目标IP地址
+* @param packet 待发送IP数据包
+* @return 发送结果
+*/
+static xnet_err_t ethernet_out(xipaddr_t* dest_ip, xnet_packet_t* packet) {
+	xnet_err_t err;
+	uint8_t* mac_addr;
+	if ((err = xarp_resolve(dest_ip, &mac_addr)) == XNET_ERR_OK) {
+		return ethernet_out_to(XNET_PROTOCOL_IP, mac_addr, packet);
+	}
+	return err;
 }
 
 /*
@@ -346,6 +362,7 @@ void xip_in(xnet_packet_t* packet) {
 	xip_hdr_t* iphdr = (xip_hdr_t*)packet->data;
 	uint32_t total_size, header_size;
 	uint16_t pre_checksum;
+	xipaddr_t src_ip;
 	// 检查版本号
 	if (iphdr->version != XNET_VERSION_IPV4) {
 		return;
@@ -367,10 +384,16 @@ void xip_in(xnet_packet_t* packet) {
 	if (!xipaddr_is_equal_buf(&netif_ipaddr, iphdr->dest_ip)) {
 		return;
 	}
-
-	// 多跟复用，分别交由ICMP、UDP、TCP处理
+	xipaddr_from_buf(&src_ip, iphdr->src_ip);
+	// 分别交由ICMP、UDP、TCP处理
 	switch (iphdr->protocol) {
+	case XNET_PROTOCOL_ICMP:
+		remove_header(packet, header_size);
+		xicmp_in(&src_ip, packet);
+		break;
 	default:
+		// 协议不可达，没有其他任何协议能处理输入的数据包
+		xicmp_dest_unreach(XICMP_CODE_PRO_UNREACH, iphdr);
 		break;
 	}
 }
@@ -405,12 +428,82 @@ xnet_err_t xip_out(xnet_protocol_t protocol, xipaddr_t* dest_ip, xnet_packet_t* 
 }
 
 /*
+* ICMP初始化
+*/
+void xicmp_init(void) {}
+
+/*
+* 发送ICMP ECHO响应 即回应ping
+* @param icmp_hdr 收到的icmp包头
+* @param src_ip 包的来源ip
+* @param packet 收到的数据包
+* @return 处理结果
+*/
+static xnet_err_t reply_icmp_request(xicmp_hdr_t* icmp_hdr, xipaddr_t* src_ip, xnet_packet_t* packet) {
+	xicmp_hdr_t* reply_hdr;
+	xnet_packet_t* tx = xnet_alloc_for_send(packet->size);
+	reply_hdr = (xicmp_hdr_t*)tx->data;
+	reply_hdr->type = XICMP_CODE_ECHO_REPLY;
+	reply_hdr->code = 0;
+	reply_hdr->id = icmp_hdr->id;
+	reply_hdr->seq = icmp_hdr->seq;
+	reply_hdr->checksum = 0;
+	memcpy(((uint8_t*)reply_hdr) + sizeof(xicmp_hdr_t), ((uint8_t*)icmp_hdr) + sizeof(xicmp_hdr_t),
+		packet->size - sizeof(xicmp_hdr_t));
+	reply_hdr->checksum = checksum16((uint16_t*)reply_hdr, tx->size, 0, 1);
+	return xip_out(XNET_PROTOCOL_ICMP, src_ip, tx);
+}
+
+/*
+* ICMP包输入处理
+* @param src_ip 数据包来源
+* @param packet 待处理的数据包
+*/
+void xicmp_in(xipaddr_t* src_ip, xnet_packet_t* packet) {
+	xicmp_hdr_t* icmphdr = (xicmp_hdr_t*)packet->data;
+	if ((packet->size >= sizeof(xicmp_hdr_t)) && (icmphdr->type == XICMP_CODE_ECHO_REQUEST)) {
+		reply_icmp_request(icmphdr, src_ip, packet);
+	}
+}
+
+/*
+* 发送ICMP端口不可达或协议不可达的响应
+* @param code 不可达的类型码
+* @param ip_hdr 收到的ip包
+* @return 处理结果
+*/
+xnet_err_t xicmp_dest_unreach(uint8_t code, xip_hdr_t* ip_hdr) {
+	xicmp_hdr_t* icmp_hdr;
+	xipaddr_t dest_ip;
+	xnet_packet_t* packet;
+	// 计算要拷贝的ip数据量
+	uint16_t ip_hdr_size = ip_hdr->hdr_len * 4;
+	uint16_t ip_data_size = swap_order16(ip_hdr->total_len) - ip_hdr_size;
+	// RFC文档中写的是8字节，但实际测试windows不止8个字节
+	ip_data_size = ip_data_size + min(ip_data_size, 8);
+	// 生成数据包，然后发送
+	packet = xnet_alloc_for_send(ip_data_size + sizeof(xicmp_hdr_t));
+	icmp_hdr = (xicmp_hdr_t*)packet->data;
+	icmp_hdr->type = XICMP_TYPE_UNREACH;
+	icmp_hdr->code = code;
+	icmp_hdr->checksum = 0;
+	icmp_hdr->id = icmp_hdr->seq = 0;
+	memcpy(((uint8_t*)icmp_hdr) + sizeof(xicmp_hdr_t), ip_hdr, ip_data_size);
+	icmp_hdr->checksum = 0;
+	icmp_hdr->checksum = checksum16((uint16_t*)icmp_hdr, packet->size, 0, 1);
+	xipaddr_from_buf(&dest_ip, ip_hdr->src_ip);
+	return xip_out(XNET_PROTOCOL_ICMP, &dest_ip, packet);
+}
+
+
+/*
 * 协议栈的初始化
 */
 void xnet_init(void) {
 	ethernet_init();
 	xarp_init();
 	xip_init();
+	xicmp_init();
 }
 
 /*
