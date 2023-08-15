@@ -790,6 +790,172 @@ static uint16_t tcp_recv(xtcp_t* tcp, uint8_t flags, uint8_t* from, uint16_t siz
 }
 
 /*
+* 分配tcp连接块
+* @return 分配结果，0-分配失败
+*/
+static xtcp_t *tcp_alloc(void){
+	xtcp_t* tcp, * end;
+	for (tcp = tcp_socket, end < tcp_socket + XTCP_CFG_MAX_TCP; tcp < end; tcp++) {
+		if (tcp->state == XTCP_STATE_FREE) {
+			tcp->state = XTCP_STATE_CLOSED;
+			tcp->local_port = 0;
+			tcp->remote_port = 0;
+			tcp->remote_ip.addr = 0;
+			tcp->handler = (xtcp_handler_t)0;
+			tcp->remote_win = XTCP_MSS_DEFAULT;
+			tcp->remote_mss = XTCP_MSS_DEFAULT;
+			tcp->unack_seq = tcp->next_seq = tcp_get_init_seq();
+			tcp->ack = 0;
+			tcp_buf_init(&tcp->rx_buf);
+			tcp_buf_init(&tcp->tx_buf);
+			return tcp;
+		}
+	}
+	return (xtcp_t*)0;
+}
+
+/*
+* 释放一个连接块
+* @param tcp 待释放的
+*/
+static void tcp_free(xtcp_t* tcp) {
+	tcp->state = XTCP_STATE_FREE;
+}
+
+/*
+* 根据远端的端口，ip找一个对应的tcp连接进行处理
+* 优先找端口，ip全部匹配的，其次找处于监听状态的
+* @param remote_ip
+* @param remote_port
+* @param local_port
+* @return
+*/
+static xtcp_t* tcp_find(xipaddr_t* remote_ip, uint16_t remote_port, uint16_t local_port) {
+	xtcp_t* tcp, * end;
+	xtcp_t* founded_tcp = (xtcp_t*)0;
+	for (tcp = tcp_socket, end = tcp_socket + XTCP_CFG_MAX_TCP; tcp < end; tcp++) {
+		if ((tcp->state == XTCP_STATE_FREE) || (tcp->local_port != local_port)) {
+			continue;
+		}
+		if (xipaddr_is_equal(remote_ip, &tcp->remote_ip) && (remote_port == tcp->remote_port)) {
+			return tcp;     // 优先，远程的端口和ip完全相同，立即返回
+		}
+		if (tcp->state == XTCP_STATE_LISTEN) {
+			founded_tcp = tcp;  // 没有，默认使用监听端口
+		}
+	}
+	return founded_tcp;
+}
+
+/*
+* 发送TCP复位包
+*/
+static xnet_err_t tcp_send_reset(uint32_t remote_ack,uint16_t local_port, xipaddr_t* remote_ip, uint16_t remote_port){
+	xnet_packet_t* packet = xnet_alloc_for_send(sizeof(xtcp_hdr_t));
+	xtcp_hdr_t* tcp_hdr = (xtcp_hdr_t*)packet->data;
+	tcp_hdr->src_port = swap_order16(local_port);
+	tcp_hdr->dest_port = swap_order16(remote_port);
+	// 固定为0即可
+	tcp_hdr->seq = 0;
+	// 响应指定的发送ack，即对上次发送的包的回应
+	tcp_hdr->ack = swap_order32(remote_ack);            
+	tcp_hdr->hdr_flags.all = 0;
+	tcp_hdr->hdr_flags.hdr_len = sizeof(xtcp_hdr_t) / 4;
+	tcp_hdr->hdr_flags.flags = XTCP_FLAG_RST | XTCP_FLAG_ACK;
+	tcp_hdr->hdr_flags.all = swap_order16(tcp_hdr->hdr_flags.all);
+	tcp_hdr->window = 0;
+	tcp_hdr->urgent_ptr = 0;
+	tcp_hdr->checksum = 0;
+	tcp_hdr->checksum = checksum_peso(&netif_ipaddr, remote_ip, XNET_PROTOCOL_TCP, (uint16_t*)packet->data, packet->size);
+	tcp_hdr->checksum = tcp_hdr->checksum ? tcp_hdr->checksum : 0xFFFF;
+	return xip_out(XNET_PROTOCOL_TCP, remote_ip, packet);
+}
+
+/*
+* 将发送缓冲区中的数据发送出去，仅最大努力发送最多
+* @param tcp 处理的tcp连接
+* @param flags 发送的标志位
+* @return 发送结果
+*/
+static xnet_err_t tcp_send(xtcp_t* tcp, uint8_t flags) {
+	xnet_packet_t* packet;
+	xtcp_hdr_t* tcp_hdr;
+	xnet_err_t err;
+	uint16_t data_size = tcp_buf_wait_send_count(&tcp->tx_buf);
+	// mss长度
+	uint16_t opt_size = (flags & XTCP_FLAG_SYN) ? 4 : 0;
+	// 判断当前允许发送的字节量
+	// 判断当前允许发送的字节量
+	if (tcp->remote_win) {
+		data_size = min(data_size, tcp->remote_win);
+		data_size = min(data_size, tcp->remote_mss);
+		if (data_size + opt_size > XTCP_DATA_MAX_SIZE) {
+			data_size = XTCP_DATA_MAX_SIZE - opt_size;
+		}
+	}
+	else {
+		data_size = 0;      // 窗口为0，不允许发数据，但允许FIN+SYN等
+	}
+	packet = xnet_alloc_for_send(data_size + opt_size + sizeof(xtcp_hdr_t));
+	tcp_hdr = (xtcp_hdr_t*)packet->data;
+	tcp_hdr->src_port = swap_order16(tcp->local_port);
+	tcp_hdr->dest_port = swap_order16(tcp->remote_port);
+	tcp_hdr->seq = swap_order32(tcp->next_seq);
+	tcp_hdr->ack = swap_order32(tcp->ack);
+	tcp_hdr->hdr_flags.all = 0;
+	tcp_hdr->hdr_flags.hdr_len = (opt_size + sizeof(xtcp_hdr_t)) / 4;
+	tcp_hdr->hdr_flags.flags = flags;
+	tcp_hdr->hdr_flags.all = swap_order16(tcp_hdr->hdr_flags.all);
+	tcp_hdr->window = swap_order16(tcp_buf_free_count(&tcp->rx_buf));
+	tcp_hdr->checksum = 0;
+	tcp_hdr->urgent_ptr = 0;
+	if (flags & XTCP_FLAG_SYN) {
+		uint8_t* opt_data = packet->data + sizeof(xtcp_hdr_t);
+		opt_data[0] = XTCP_KIND_MSS;
+		opt_data[1] = 4;        // 该选项总长，含0,1字节
+		*(uint16_t*)(opt_data + 2) = swap_order16(XTCP_MSS_DEFAULT);
+	}
+	tcp_buf_read_for_send(&tcp->tx_buf, packet->data + opt_size + sizeof(xtcp_hdr_t), data_size);
+	tcp_hdr->checksum = checksum_peso(&netif_ipaddr, &tcp->remote_ip, XNET_PROTOCOL_TCP, (uint16_t*)packet->data, packet->size);
+	tcp_hdr->checksum = tcp_hdr->checksum ? tcp_hdr->checksum : 0xFFFF;
+
+	err = xip_out(XNET_PROTOCOL_TCP, &tcp->remote_ip, packet);
+	if (err < 0) return err;
+	tcp->remote_win -= data_size;               // 同时远端可用窗口减少
+	tcp->next_seq += data_size;                 // 新发送，序号要增加
+	tcp_buf_add_unacked_count(&tcp->tx_buf, data_size); // 增加已发送但未确认的量
+	if (flags & (XTCP_FLAG_SYN | XTCP_FLAG_FIN)) {        // FIN占用1个序号
+		tcp->next_seq++;
+	}
+	return XNET_ERR_OK;
+}
+
+/**
+ * 从tcp包头中读取选项字节。简单起见，仅读取mss字段
+ * @param tcp 待读取的tcp连接
+ * @param tcp_hdr tcp包头
+ */
+static void tcp_read_mss(xtcp_t* tcp, xtcp_hdr_t* tcp_hdr) {
+	uint16_t opt_len = tcp_hdr->hdr_flags.hdr_len * 4 - sizeof(xtcp_hdr_t);
+
+	if (opt_len == 0) {
+		tcp->remote_mss = XTCP_MSS_DEFAULT;
+	}
+	else {
+		uint8_t* opt_data = (uint8_t*)tcp_hdr + sizeof(xtcp_hdr_t);
+		uint8_t* opt_end = opt_data + opt_len;
+
+		while ((*opt_data != XTCP_KIND_END) && (opt_data < opt_end)) {
+			if ((*opt_data++ == XTCP_KIND_MSS) && (*opt_data++ == 4)) {
+				tcp->remote_mss = swap_order16(*(uint16_t*)opt_data);
+				return;
+			}
+		}
+	}
+}
+
+
+/*
 * 协议栈的初始化
 */
 void xnet_init(void) {
