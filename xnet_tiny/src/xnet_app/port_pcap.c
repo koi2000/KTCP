@@ -42,9 +42,9 @@ xnet_err_t xnet_driver_send(xnet_packet_t* packet) {
  */
 xnet_err_t xnet_driver_read(xnet_packet_t** packet) {
 	uint16_t size;
-	xnet_packet_t* r_packet = xnet_alloc_for_read(XNET_CFG_PACKGE_MAX_SIZE);
+	xnet_packet_t* r_packet = xnet_alloc_for_read(XNET_CFG_PACKET_MAX_SIZE);
 
-	size = pcap_device_read(pcap, r_packet->data, XNET_CFG_PACKGE_MAX_SIZE);
+	size = pcap_device_read(pcap, r_packet->data, XNET_CFG_PACKET_MAX_SIZE);
 	if (size) {
 		r_packet->size = size;
 		*packet = r_packet;

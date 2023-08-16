@@ -5,8 +5,8 @@
 #include "xnet_tiny.h"
 
 #define min(a,b) ((a)>(b)?(b):(a))
-#define XTCP_DATA_MAX_SIZE (XNET_CFG_PACKET_MAX_SIZE - sizeof(xether_hdr_t) - sizeof(xip_hdr_t) - sizeof(xtcp_hdr_t))
-#define tcp_get_init_seq() ((rand()<<16)_rand())
+#define XTCP_DATA_MAX_SIZE       (XNET_CFG_PACKET_MAX_SIZE - sizeof(xether_hdr_t) - sizeof(xip_hdr_t) - sizeof(xtcp_hdr_t))
+#define tcp_get_init_seq() ((rand()<<16)+rand())
 
 static const xipaddr_t netif_ipaddr = XNET_CFG_NETIF_IP;
 static const uint8_t ether_broadcast[] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
@@ -64,7 +64,7 @@ int xnet_check_tmo(xnet_time_t*time,uint32_t sec){
 */
 xnet_packet_t * xnet_alloc_for_send(uint16_t data_size){
 	// 从tx_packet的后端向前分配，因为前面要预留作为各种协议的头部数据存储空间
-	tx_packet.data = tx_packet.payload + XNET_CFG_PACKGE_MAX_SIZE - data_size;
+	tx_packet.data = tx_packet.payload + XNET_CFG_PACKET_MAX_SIZE - data_size;
 	tx_packet.size = data_size;
 	return &tx_packet;
 }
@@ -795,7 +795,7 @@ static uint16_t tcp_recv(xtcp_t* tcp, uint8_t flags, uint8_t* from, uint16_t siz
 */
 static xtcp_t *tcp_alloc(void){
 	xtcp_t* tcp, * end;
-	for (tcp = tcp_socket, end < tcp_socket + XTCP_CFG_MAX_TCP; tcp < end; tcp++) {
+	for (tcp = tcp_socket, end = tcp_socket + XTCP_CFG_MAX_TCP; tcp < end; tcp++) {
 		if (tcp->state == XTCP_STATE_FREE) {
 			tcp->state = XTCP_STATE_CLOSED;
 			tcp->local_port = 0;
@@ -872,7 +872,7 @@ static xnet_err_t tcp_send_reset(uint32_t remote_ack,uint16_t local_port, xipadd
 }
 
 /*
-* 将发送缓冲区中的数据发送出去，仅最大努力发送最多
+* 将发送缓冲区中的数据发送出去，尽最大努力发送最多
 * @param tcp 处理的tcp连接
 * @param flags 发送的标志位
 * @return 发送结果
@@ -884,7 +884,6 @@ static xnet_err_t tcp_send(xtcp_t* tcp, uint8_t flags) {
 	uint16_t data_size = tcp_buf_wait_send_count(&tcp->tx_buf);
 	// mss长度
 	uint16_t opt_size = (flags & XTCP_FLAG_SYN) ? 4 : 0;
-	// 判断当前允许发送的字节量
 	// 判断当前允许发送的字节量
 	if (tcp->remote_win) {
 		data_size = min(data_size, tcp->remote_win);
@@ -954,6 +953,245 @@ static void tcp_read_mss(xtcp_t* tcp, xtcp_hdr_t* tcp_hdr) {
 	}
 }
 
+/*
+* 处理TCP连接
+*/
+static void tcp_process_accept(xtcp_t* listen_tcp, xipaddr_t* remote_ip, xtcp_hdr_t* tcp_hdr) {
+	uint16_t hdr_flags = tcp_hdr->hdr_flags.all;
+	// 对于监听套接字，仅处理syn，其余发reset处理
+	if (hdr_flags & XTCP_FLAG_SYN) {
+		xnet_err_t err;
+		uint32_t ack = tcp_hdr->seq + 1;
+		xtcp_t* new_tcp = tcp_alloc();
+		if (!new_tcp)return;
+		// 更新状态
+		new_tcp->state = XTCP_STATE_SYNC_RECVD;
+		new_tcp->local_port = listen_tcp->local_port;
+		new_tcp->handler = listen_tcp->handler;
+		new_tcp->remote_port = tcp_hdr->src_port;
+		new_tcp->remote_ip.addr = remote_ip->addr;
+		new_tcp->ack = ack;
+		// 使用自己的，不用监听套接字的
+		new_tcp->next_seq = new_tcp->unack_seq = tcp_get_init_seq();
+		new_tcp->remote_win = tcp_hdr->window;
+		tcp_read_mss(new_tcp, tcp_hdr);
+		err = tcp_send(new_tcp, XTCP_FLAG_SYN | XTCP_FLAG_ACK);
+		if (err < 0) {
+			tcp_free(new_tcp);
+			return;
+		}
+	}
+	else {
+		tcp_send_reset(tcp_hdr->seq, listen_tcp->local_port, remote_ip, tcp_hdr->src_port);
+	}
+}
+
+/*
+* TCP包的输入处理
+*/
+void xtcp_in(xipaddr_t* remote_ip, xnet_packet_t* packet) {
+	xtcp_hdr_t* tcp_hdr = (xtcp_hdr_t*)packet->data;
+	xtcp_t* tcp;
+	uint16_t pre_checksum;
+	uint16_t read_size;
+	// 大小检查，至少要有负载数据
+	if (packet->size < sizeof(xtcp_hdr_t)) {
+		return;
+	}
+	pre_checksum = tcp_hdr->checksum;
+	tcp_hdr->checksum = 0;
+	if (pre_checksum != 0) {
+		uint16_t checksum = checksum_peso(remote_ip, &netif_ipaddr, XNET_PROTOCOL_TCP, (uint16_t*)tcp_hdr, packet->size);
+		checksum = (checksum == 0) ? 0xFFFF : checksum;
+		if (checksum != pre_checksum) {
+			return;
+		}
+	}
+	// 从包头中解析相关参数
+	tcp_hdr->src_port = swap_order16(tcp_hdr->src_port);
+	tcp_hdr->dest_port = swap_order16(tcp_hdr->dest_port);
+	tcp_hdr->hdr_flags.all = swap_order16(tcp_hdr->hdr_flags.all);
+	tcp_hdr->seq = swap_order32(tcp_hdr->seq);
+	tcp_hdr->ack = swap_order32(tcp_hdr->ack);
+	tcp_hdr->window = swap_order16(tcp_hdr->window);
+	// 找到对应处理的tcb，可能是监听tcb，也可能是已经连接的tcb，没有处理项，则复位通知
+	tcp = tcp_find(remote_ip, tcp_hdr->src_port, tcp_hdr->dest_port);
+	if (tcp == (xtcp_t*)0) {
+		tcp_send_reset(tcp_hdr->seq + 1, tcp_hdr->dest_port, remote_ip,tcp_hdr->src_port);
+		return;
+	}
+	tcp->remote_win = tcp_hdr->window;
+	// 监听套接字，只能接受SYNC请求，其他包直接发送复位错误。没有可用的tcb，也发送复位
+	if (tcp->state == XTCP_STATE_LISTEN) {
+		tcp_process_accept(tcp, remote_ip, tcp_hdr);
+		return;
+	}
+	// 序号不一致，可能要进行重发
+	if (tcp_hdr->seq != tcp->ack) {
+		tcp_send_reset(tcp_hdr->seq + 1, tcp_hdr->dest_port, remote_ip, tcp_hdr->src_port);
+		return;
+	}
+	// 序号相同时的处理
+	remove_header(packet, tcp_hdr->hdr_flags.hdr_len * 4);
+	switch (tcp->state) {
+	case XTCP_STATE_SYNC_RECVD:
+		// 已经收到SYN，且发了SYN+ACK，检查是否是ACK，是，则连接成功
+		if (tcp_hdr->hdr_flags.flags & XTCP_FLAG_ACK) {
+			// 收到ACK，则说明已经建立成功，进入已经连接成功状态
+			// syn占用了一个序号
+			tcp->unack_seq++;
+			tcp->state = XTCP_STATE_ESTABLISHED;
+			tcp->handler(tcp, XTCP_CONN_CONNECTED);
+		}
+		break;
+	case XTCP_STATE_ESTABLISHED:
+		// 这里可能收到数据，或者FIN
+		if (tcp_hdr->hdr_flags.flags & (XTCP_FLAG_ACK | XTCP_FLAG_FIN)) {
+			// 先处理ACK的值，即ACK确认之前发的数据被接收了，有两种情况
+			// 1. 远程ack的值比自己未确认的值相等或者更大，则说明有部分数据被远端接收确认了
+			// 2. 远程ack < tcp_unack_seq ，即可能之前重发的ack，不处理
+			// 简单起见，不考虑序号溢出问题
+			if (tcp_hdr->hdr_flags.flags & XTCP_FLAG_ACK) {
+				if ((tcp->unack_seq < tcp_hdr->ack) && (tcp_hdr->ack <= tcp->next_seq)) {
+					uint16_t curr_ack_size = tcp_hdr->ack - tcp->unack_seq;
+					tcp_buf_add_acked_count(&tcp->tx_buf, curr_ack_size);
+					tcp->unack_seq += curr_ack_size;
+				}
+			}
+			// 再读取当前包中的数据，里面可能是携带有数据的，即便是FIN，也可能是带有数据
+			read_size = tcp_recv(tcp, (uint8_t)tcp_hdr->hdr_flags.flags, packet->data, packet->size);
+			// 再然后，根据当前的标志位处理
+			if (tcp_hdr->hdr_flags.flags & XTCP_FLAG_FIN) {
+				// 收到关闭请求，发送ACK，同时也发送FIN，同时直接主动关掉，省的麻烦
+				// 这样就不必进入CLOSE_WAIT，然后再等待对方的ACK
+				tcp->state = XTCP_STATE_LAST_ACK;
+				tcp->ack++;
+				tcp_send(tcp, XTCP_FLAG_ACK | XTCP_FLAG_FIN);
+			}
+			else if (read_size) {
+				// 非FIN，看看有无数据，有的话发ACK响应
+				// 如果是收到数据，发送ACK响应
+				tcp_send(tcp, XTCP_FLAG_ACK);
+				tcp->handler(tcp, XTCP_CONN_DATA_RECV);
+			}
+			else if (tcp_buf_wait_send_count(&tcp->tx_buf)) {
+				// 或者看看有没有数据要发，有的话，同时发数据即ack
+				// 没有收到数据，可能是对方发来的ACK。此时，有数据就发数据，没数据就不理会
+				tcp_send(tcp, XTCP_FLAG_ACK);
+			}
+			// 其他情况，即对方只是简单一个ACK，不发送任何响应处理
+		}
+		break;
+	case XTCP_STATE_FIN_WAIT_1:
+		// 收到ack后，自己的发送已经关掉，但仍可接收，等待对方发FIN
+		if ((tcp_hdr->hdr_flags.flags & (XTCP_FLAG_FIN | XTCP_FLAG_ACK)) == (XTCP_FLAG_ACK | XTCP_FLAG_FIN)) {
+			tcp_free(tcp);
+		}
+		else if (tcp_hdr->hdr_flags.flags & XTCP_FLAG_ACK) {
+			// 如果在此状态下收到了ACK
+			tcp->state = XTCP_STATE_FIN_WAIT_2;
+		}
+		break;
+	case XTCP_STATE_FIN_WAIT_2:
+		// 自己发送关闭，但仍然能接受数据
+		// 不做半关闭下仍然接收数据的处理
+		if (tcp_hdr->hdr_flags.flags&XTCP_FLAG_FIN) {
+			tcp->ack++;
+			tcp_send(tcp, XTCP_FLAG_ACK);
+			tcp_free(tcp);
+		}
+		break;
+	case XTCP_STATE_LAST_ACK:
+		if (tcp_hdr->hdr_flags.flags & XTCP_FLAG_ACK) {
+			tcp->handler(tcp, XTCP_CONN_CLOSED);
+			tcp_free(tcp);
+		}
+		break;
+	default:
+		break;
+	}
+}
+
+/*
+* TCP初始化
+*/
+void xtcp_init(void){
+	memset(tcp_socket, 0, sizeof(tcp_socket));
+}
+
+/*
+* 打开TCP
+*/
+xtcp_t* xtcp_open(xtcp_handler_t handler) {
+	xtcp_t* tcp = tcp_alloc();
+	if (!tcp)return (xtcp_t*)0;
+	tcp->state = XTCP_STATE_CLOSED;
+	tcp->handler = handler;
+	return tcp;
+}
+
+/*
+* 建立tcp与指定本地端口的关联，使得其能够处理来自该端口的包
+* 以及通过该端口发送数据包
+*/
+xnet_err_t xtcp_bind(xtcp_t* tcp, uint16_t local_port) {
+	xtcp_t* curr, * end;
+	for (curr = tcp_socket, end = &tcp_socket[XTCP_CFG_MAX_TCP]; curr < end; curr++) {
+		if ((curr != tcp) && (curr->local_port == local_port)) {
+			return XNET_ERR_BINDED;
+		}
+	}
+	tcp->local_port = local_port;
+	return XNET_ERR_OK;
+}
+
+/**
+ * 控制tcp进入监听状态
+ */
+xnet_err_t xtcp_listen(xtcp_t* tcp) {
+	tcp->state = XTCP_STATE_LISTEN;
+	return XNET_ERR_OK;
+}
+
+/**
+ * 从TCP中读取数据
+ */
+uint16_t xtcp_read(xtcp_t* tcp, uint8_t* data, uint16_t size) {
+	return tcp_buf_read(&tcp->rx_buf, data, size);
+}
+
+/*
+* 向TCP发送数据
+*/
+int xtcp_write(xtcp_t* tcp, uint8_t* data, uint16_t size) {
+	uint16_t send_size;
+	if ((tcp->state != XTCP_STATE_ESTABLISHED)) {
+		return -1;
+	}
+	send_size = tcp_buf_write(&tcp->tx_buf, data, size);
+	if (send_size) {
+		// 考虑到远程窗口可能为0，所以下面的调用不一定发送数据
+		// 数据将仅仅停留在缓存中，当下次收到对方的win更新时，再进行发送
+		tcp_send(tcp, XTCP_FLAG_ACK);
+	}
+	return send_size;
+}
+
+/*
+* 关掉TCP连接
+*/
+xnet_err_t xtcp_close(xtcp_t* tcp) {
+	xnet_err_t err;
+	if (tcp->state == XTCP_STATE_ESTABLISHED) {
+		err = tcp_send(tcp, XTCP_FLAG_FIN | XTCP_FLAG_ACK);
+		if (err < 0)return err;
+		tcp->state = XTCP_STATE_FIN_WAIT_1;
+	}
+	else {
+		tcp_free(tcp);
+	}
+	return XNET_ERR_OK;
+}
 
 /*
 * 协议栈的初始化
@@ -964,6 +1202,8 @@ void xnet_init(void) {
 	xip_init();
 	xicmp_init();
 	xudp_init();
+	xtcp_init();
+	srand(xsys_get_time());
 }
 
 /*

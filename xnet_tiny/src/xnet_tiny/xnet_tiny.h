@@ -5,7 +5,7 @@
 // 本地IP
 #define XNET_CFG_NETIF_IP {192,168,137,2}
 // 收发数据包的最大大小
-#define XNET_CFG_PACKGE_MAX_SIZE 1516
+#define XNET_CFG_PACKET_MAX_SIZE 1516
 // ARP表项超时时间
 #define XARP_CFG_ENTRY_OK_TMO (5)
 // ARP表项挂起超时时间
@@ -158,7 +158,7 @@ typedef struct _xnet_packet_t {
 	// 包中数据起始地址
 	uint8_t* data;
 	// 最大负载数据量
-	uint8_t payload[XNET_CFG_PACKGE_MAX_SIZE];
+	uint8_t payload[XNET_CFG_PACKET_MAX_SIZE];
 }xnet_packet_t;
 // 时间类型，返回当前系统跑了多少个100ms
 typedef uint32_t xnet_time_t;
@@ -277,6 +277,7 @@ typedef enum _tcp_state_t {
 	XTCP_STATE_CLOSED,
 	XTCP_STATE_LISTEN,
 	XTCP_STATE_SYNC_RECVD,
+	XTCP_STATE_ESTABLISHED,
 	XTCP_STATE_FIN_WAIT_1,
 	XTCP_STATE_FIN_WAIT_2,
 	XTCP_STATE_CLOSING,
